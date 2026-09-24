@@ -77,6 +77,100 @@ def test_retained_floor_is_independent_of_limit_and_cursor(tmp_path):
     assert empty["first_retained_seq"] is None and empty["first_retained_ts"] is None
 
 
+def test_retained_floor_and_messages_come_from_one_ring(tmp_path, monkeypatch):
+    """A compaction landing between the floor pass and the tail read must not pair ring A's
+    floor with ring B's messages — the floor would then claim records that are gone."""
+    import store
+
+    for i in range(40):
+        store.append(tmp_path, "ring", "bot", f"line {i} " + "x" * 60)
+    path = store.room_path(tmp_path, "ring")
+    floor, fired = store._retained_floor, []
+
+    def compact_after_floor(*args, **kwargs):
+        found = floor(*args, **kwargs)
+        if not fired:
+            fired.append(True)
+            store._compact(path, keep=path.stat().st_size // 2)
+        return found
+
+    monkeypatch.setattr(store, "_retained_floor", compact_after_floor)
+    view = store.read_messages(tmp_path, "ring", limit=200)
+    assert fired and json.loads(path.read_bytes().split(b"\n", 1)[0])["seq"] > 1  # it moved
+    assert view["first_retained_seq"] == view["first_seq"] == 1
+    assert view["count"] == 40
+
+
+def _write_ring(path, records):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Raw UTF-8, as the store writes it: record width in bytes is what the floor search sees.
+    path.write_bytes(
+        b"".join(json.dumps(rec, ensure_ascii=False).encode() + b"\n" for rec in records)
+    )
+
+
+@pytest.mark.parametrize(
+    ("expired", "pad", "torn"),
+    [(20_000, "x" * 400, False), (20_000, "x" * 400, True), (1_500, "\u20ac" * 2_000, False)],
+    ids=["clean", "torn-lines-in-prefix", "multibyte-records-wider-than-the-scan-window"],
+)
+def test_ephemeral_floor_does_not_walk_the_expired_prefix(
+    tmp_path, monkeypatch, expired, pad, torn
+):
+    """A near-cap `e-` room that is almost all expired: one limit=1 read must cost a bounded
+    number of parses, not one per expired record. A line that does not parse is no floor
+    either, so torn lines in the prefix must not pull the search back into it; and a record
+    wider than FLOOR_SCAN_BYTES (2,000 three-byte characters, inside the character cap) puts
+    midpoints inside the line just before the floor."""
+    import store
+
+    stale, live = "2000-01-01T00:00:00.000000Z", store._now()
+    head = expired + 1
+    records = [{"seq": s, "ts": stale, "from": "bot", "text": pad} for s in range(1, head)]
+    records += [{"seq": s, "ts": live, "from": "bot", "text": pad} for s in range(head, head + 5)]
+    path = store.room_path(tmp_path, "e-floor")
+    _write_ring(path, records)
+    if torn:
+        lines = path.read_bytes().split(b"\n")
+        lines[:expired] = [ln[:40] if i % 3 == 0 else ln for i, ln in enumerate(lines[:expired])]
+        path.write_bytes(b"\n".join(lines))
+    assert path.stat().st_size > store.MAX_ROOM_BYTES * (0.6 if torn else 0.8)
+
+    parse, calls = store._parse, []
+    monkeypatch.setattr(store, "_parse", lambda line: calls.append(1) or parse(line))
+    view = store.read_messages(tmp_path, "e-floor", limit=1)
+    assert view["first_retained_seq"] == head and view["first_seq"] == head + 4
+    assert view["first_retained_ts"] == live
+    assert len(calls) < 64, f"{len(calls)} parses for a one-record read"
+
+
+def test_ephemeral_floor_errs_high_when_ts_is_out_of_order(tmp_path):
+    """`ts` is stamped before the room lock orders a write and is never clamped, so file
+    order and `ts` order can disagree. The floor may then skip a readable record, but what
+    it reports must itself be readable and `/export` must serve everything from it on."""
+    import store
+
+    stale, live = "2000-01-01T00:00:00.000000Z", store._now()
+    records = [{"seq": s, "ts": stale, "from": "bot", "text": "x" * 200} for s in range(1, 3001)]
+    records.append({"seq": 3001, "ts": live, "from": "bot", "text": "readable, then hidden"})
+    records.append({"seq": 3002, "ts": stale, "from": "bot", "text": "clock stepped back"})
+    records.append({"seq": 3003, "ts": "not a time", "from": "bot", "text": "unparseable ts"})
+    records += [{"seq": s, "ts": live, "from": "bot", "text": "y" * 200} for s in range(3004, 3100)]
+    path = store.room_path(tmp_path, "e-skew")
+    _write_ring(path, records)
+    path.write_bytes(path.read_bytes().replace(b'"seq": 3050,', b'"seq": 3050, torn', 1))
+
+    view = store.read_messages(tmp_path, "e-skew", limit=5)
+    _, chunks = store.export_room(tmp_path, "e-skew")
+    exported = [
+        json.loads(line)["seq"] for line in b"".join(chunks).splitlines() if b"torn" not in line
+    ]
+    floor = view["first_retained_seq"]
+    assert floor >= exported[0] == 3001  # never below what /export actually starts at
+    assert floor not in (3002, 3003, 3050)  # never a stale, unparseable or torn record
+    assert all(seq in exported for seq in range(floor, 3100) if seq != 3050)
+
+
 def test_room_count_is_capped_so_disk_is_bounded(tmp_path, monkeypatch):
     import store
 

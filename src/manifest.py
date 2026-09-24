@@ -266,7 +266,6 @@ _ROOM_VIEW_SCHEMA = {
             "type": ["string", "null"],
             "description": "Timestamp of `first_retained_seq`, or null when the room has no readable records.",
         },
-
         "last_seq": {"type": "integer", "description": "Pass back as `since` to poll."},
         "messages": {"type": "array", "items": _MESSAGE_SCHEMA},
         "wait_held": {
@@ -280,7 +279,14 @@ _ROOM_VIEW_SCHEMA = {
             ),
         },
     },
-    "required": ["room", "count", "first_retained_seq", "first_retained_ts", "last_seq", "messages"],
+    "required": [
+        "room",
+        "count",
+        "first_retained_seq",
+        "first_retained_ts",
+        "last_seq",
+        "messages",
+    ],
 }
 
 

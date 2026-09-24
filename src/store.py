@@ -877,16 +877,45 @@ def _parse(line: bytes) -> dict | None:
     return rec if isinstance(rec, dict) and isinstance(rec.get("seq"), int) else None
 
 
-def _retained_floor(path: Path, cutoff: float | None) -> dict | None:
-    """Oldest readable record in the room file, not merely the oldest in one response.
+FLOOR_SCAN_BYTES = 4096  # below this gap the floor search stops halving and reads forward
 
-    The tail reader is bounded by `limit`; its first item cannot tell a lagging consumer
-    where the ring starts. Same expiry rule as `read_messages`.
+
+def _retained_floor(f, cutoff: float | None) -> dict | None:
+    """The oldest readable record in the already-open room file `f`, for `first_retained_*`.
+
+    Takes the reader's descriptor rather than the path: opened twice, a compaction or a reap
+    between the opens reports a floor from one ring beside messages from another (#775).
+
+    Every class but `e-` retains from its first line, so that costs one parse. An `e-` room
+    halves over byte offsets instead of walking its expired prefix, which a near-cap room can
+    make megabytes long: O(log size) parses, then one forward read that starts at most
+    FLOOR_SCAN_BYTES before the floor and ends with the floor record itself, which can be
+    wider (4096 three-byte characters is ~12 KB).
+
+    `ts` is not monotonic in file order — `_now()` stamps a record before the room lock
+    orders it, and nothing corrects a wall clock that steps back — so the search can land
+    past a readable record hidden behind a stale-looking one. What it returns is always
+    itself readable, and `/export` serves everything from it on, so the floor can only err
+    high: it may call a recoverable record lost, never a lost record recoverable. A line
+    that does not parse reads as expired, and so does one whose `ts` does not (`_expired`).
     """
-    with suppress(FileNotFoundError), path.open("rb") as f:
-        for raw in f:
-            if (rec := _parse(raw)) is not None and (cutoff is None or not _expired(rec, cutoff)):
-                return rec
+    lo, hi = 0, os.fstat(f.fileno()).st_size
+    while cutoff is not None and hi - lo > FLOOR_SCAN_BYTES:
+        mid = (lo + hi) // 2
+        f.seek(mid)
+        f.readline()  # finish the line the midpoint fell inside; `lo` stays a line start
+        if (start := f.tell()) >= hi:
+            hi = mid  # no line starts in [mid, hi): the answer, if any, starts before mid
+            continue
+        rec = _parse(f.readline())
+        if rec is None or _expired(rec, cutoff):
+            lo = f.tell()
+        else:
+            hi = start
+    f.seek(lo)
+    for raw in f:
+        if (rec := _parse(raw)) is not None and (cutoff is None or not _expired(rec, cutoff)):
+            return rec
     return None
 
 
@@ -902,13 +931,17 @@ def read_messages(
     # advancing past records nobody can read any more, or an expired room would reuse seqs.
     cutoff = _cutoff(room)
     out: list[dict] = []
-    retained = _retained_floor(path, cutoff)
+    retained, generation = None, None
     # The room's head, where a cursor past it is clamped (#565): echoing it back printed a
     # `next:` that polls a dead cursor forever, and let a caller put a number of any width
     # into every JSON reply. The newest record on disk, expired or not, for the same reason
     # `last_seq` does not filter.
     head_seq = 0
     with suppress(FileNotFoundError), path.open("rb") as f:
+        # Read beside the open, as `export_room` does, so the floor, the messages and the
+        # generation all describe the one ring this descriptor holds.
+        generation = room_generation(root, room)
+        retained = _retained_floor(f, cutoff)
         for raw in reverse_lines(f):
             rec = _parse(raw)
             if rec is None:
@@ -931,7 +964,7 @@ def read_messages(
         "last_seq": out[-1]["seq"] if out else min(since or 0, head_seq),
         "first_retained_seq": retained["seq"] if retained else None,
         "first_retained_ts": retained["ts"] if retained else None,
-        "generation": room_generation(root, room),
+        "generation": room_generation(root, room) if generation is None else generation,
         "messages": out,
     }
 
